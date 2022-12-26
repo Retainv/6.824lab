@@ -87,6 +87,8 @@ type Raft struct {
 	role       int
 	inElection bool // 是否正在进行选举
 	interrupt  bool // 选举过程中是否收到leader心跳
+
+	votedTerm int // 投票的term
 }
 
 type LogEntry struct {
@@ -118,9 +120,11 @@ func (rf *Raft) GetState() (int, bool) {
 	} else {
 		isLeader = false
 	}
+	term := rf.currentTerm
 	rf.mu.Unlock()
 	// Your code here (2A).
-	return rf.currentTerm, isLeader
+	PrettyDebug(dTrace, "S%d isLeader:%v", rf.me, isLeader)
+	return term, isLeader
 }
 
 //
@@ -231,12 +235,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//PrettyDebug(dVote, "candidate %d term: %d, server %d term: %d\n", args.CandidateId, args.Term, rf.me, rf.currentTerm)
 	PrettyDebug(dVote, "S%d 收到S%d 的RequestVote,term:%d, \n", args.CandidateId, rf.me, rf.currentTerm)
-	if (rf.votedFor == NO_VOTE || args.CandidateId == rf.votedFor) && args.LastLogTerm >= lastLog.Term && args.LastLogIndex >= lastLog.Index && args.Term >= rf.currentTerm {
-		PrettyDebug(dVote, "S%d voted for S%d", rf.me, args.CandidateId)
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		rf.persist()
-		PrettyDebug(dVote, "S%d投了S%d一票\n", rf.me, args.CandidateId)
+	if args.LastLogTerm >= lastLog.Term && args.LastLogIndex >= lastLog.Index && args.Term >= rf.currentTerm {
+		// 新一轮term
+		if args.Term > rf.votedTerm {
+			rf.votedFor = NO_VOTE
+		}
+		// 如果该term还未投票或者已给他投票，则返回
+		if rf.votedFor == NO_VOTE || args.CandidateId == rf.votedFor {
+			PrettyDebug(dVote, "S%d voted for S%d", rf.me, args.CandidateId)
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			rf.persist()
+			PrettyDebug(dVote, "S%d投了S%d一票\n", rf.me, args.CandidateId)
+		} else {
+			reply.VoteGranted = false
+			PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
+		}
+
 	} else {
 		reply.VoteGranted = false
 		PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
@@ -255,7 +270,7 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 			rf.role = FOLLOWER
 			rf.currentTerm = args.LeaderTerm
 			// 心跳重置选举时间
-			PrettyDebug(dLeader, "S%d -> S%d 心跳，重置选举时间, term:%d", args.LeaderId, rf.me, rf.currentTerm)
+			PrettyDebug(dTerm, "S%d 收到 S%d 心跳，重置选举时间, term:%d", rf.me, args.LeaderId, rf.currentTerm)
 			rf.ResetElectionTimer()
 			rf.votedFor = NO_VOTE
 			reply.Success = true
@@ -304,49 +319,56 @@ func (rf *Raft) StartElection() {
 	group.Add(len(rf.peers) - 1)
 
 	done := make(chan bool)
+	channels := make([]chan bool, len(rf.peers))
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(i int) {
+			timeout := make(chan bool)
+			channels[i] = timeout
 			defer group.Done()
-			//for {
-			//	select {
-			//	case <-timeout:
-			//		return
-			//	default:
-			//
-			//		if reply.Term != 0 {
-			//			timeout <- true
-			//			return
-			//		}
-			//	}
-			//}
-			reply := &RequestVoteReply{}
-			rf.sendRequestVote(i, args, reply)
-			PrettyDebug(dTrace, "S%d sent RequestVote to S%d", rf.me, i)
-			PrettyDebug(dTrace, "S%d to S%d，reply：%v", rf.me, i, reply)
-			// 如果别人的term比我大，则退出
-			if reply.Term >= rf.currentTerm {
-				rf.mu.Lock()
-				rf.currentTerm = reply.Term
-				rf.votedFor = NO_VOTE
-				rf.role = FOLLOWER
-				rf.interrupt = true
-				rf.mu.Unlock()
-				done <- true
-				return
-			}
-			if reply.VoteGranted {
-				atomic.AddInt32(&votedForMe, 1)
-				PrettyDebug(dTrace, "S%d got S%d's vote,votes:%d", rf.me, i, atomic.LoadInt32(&votedForMe))
-				// 如果票数超过一半，则不再等待
-				if atomic.LoadInt32(&votedForMe) > (int32(len(rf.peers)))/2 {
-					winElection = true
-					done <- true
-					PrettyDebug(dTrace, "S%d win!", rf.me)
+			for {
+				select {
+				case <-timeout:
+					PrettyDebug(dTrace, "S%d->S%d rpc out", rf.me, i)
+					return
+				default:
+					reply := &RequestVoteReply{}
+					rf.sendRequestVote(i, args, reply)
+					PrettyDebug(dTrace, "S%d sent RequestVote to S%d", rf.me, i)
+					PrettyDebug(dTrace, "S%d to S%d，reply：%v", rf.me, i, reply)
+					// 如果别人的term比我大，则退出
+					if reply.Term > rf.currentTerm {
+						rf.mu.Lock()
+						rf.currentTerm = reply.Term
+						rf.votedFor = NO_VOTE
+						rf.role = FOLLOWER
+						rf.interrupt = true
+						rf.mu.Unlock()
+						done <- true
+						timeout <- true
+						//return
+					}
+					if reply.VoteGranted {
+						atomic.AddInt32(&votedForMe, 1)
+						PrettyDebug(dTrace, "S%d got S%d's vote,votes:%d", rf.me, i, atomic.LoadInt32(&votedForMe))
+						// 如果票数超过一半，则不再等待
+						if atomic.LoadInt32(&votedForMe) > (int32(len(rf.peers)))/2 {
+							winElection = true
+							done <- true
+							PrettyDebug(dTrace, "S%d win!", rf.me)
+						}
+						timeout <- true
+						//return
+					}
+					if reply.Term != 0 {
+						timeout <- true
+						//return
+					}
+					time.Sleep(100 * time.Millisecond)
+
 				}
-				return
 			}
 
 		}(i)
@@ -358,19 +380,25 @@ func (rf *Raft) StartElection() {
 	}()
 	// wait超时
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 		done <- true
+		for i := range channels {
+			channels[i] <- true
+		}
 	}()
 	<-done
 	PrettyDebug(dVote, "S%v got vote:%v", rf.me, votedForMe)
 	// 如果竞选过程中收到原来leader的消息变回了follower
 	if rf.interrupt {
+		rf.mu.Lock()
 		PrettyDebug(dVote, "S%d 选举过程中收到leader消息或别人term比我大，退出选举", rf.me)
 		//rf.currentTerm--
 		rf.votedFor = NO_VOTE
-		rf.interrupt = false
+		rf.role = FOLLOWER
 		rf.inElection = false
+		rf.interrupt = false
 		rf.ResetElectionTimer()
+		rf.mu.Unlock()
 		return
 	}
 	rf.mu.Lock()
@@ -566,7 +594,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 func (rf *Raft) ResetElectionTimer() {
-	i := 400 + (rand.Int63() % 400)
+	i := 300 + (rand.Int63() % 500)
 	electionTime := (time.Duration)(i) * time.Millisecond
 	PrettyDebug(dTimer, "S%d reset：%d ms", rf.me, i)
 	rf.electionTimer.Reset(electionTime)
