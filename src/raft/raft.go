@@ -539,21 +539,21 @@ func (rf *Raft) CallHeartBeat(i int) {
 		LeaderCommit: rf.commitIndex,
 	}
 	// 否则发送nextIndex到后面所有的日志
-	PrettyDebug(dLog, "S%d nextIndex:%v", rf.me, rf.nextIndex)
-	if rf.nextIndex[i] < len(rf.logs) {
+	if rf.nextIndex[i]-1 < len(rf.logs) {
 		prevIndex, preLogTerm := 0, 0
 		if rf.nextIndex[i] > 1 {
+			// rf.nextIndex[i]-2 是为了匹配server的最新日志
 			prevEntry := rf.logs[rf.nextIndex[i]-2]
 			prevIndex = prevEntry.Index
 			preLogTerm = prevEntry.Term
 		}
-		PrettyDebug(dLog, "S%d->S%d nextIndex:%d,", rf.me, i, rf.nextIndex[i])
 		args = &AppendEntryArgs{
 			Term:         HEARTBEAT,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevIndex,
 			PrevLogTerm:  preLogTerm,
-			Entries:      rf.logs[rf.nextIndex[i]:],
+			// 从server最新日志后面一条开始到leader最新日志的所有日志补发
+			Entries:      rf.logs[rf.nextIndex[i]-1:],
 			LeaderTerm:   rf.currentTerm,
 			LeaderCommit: rf.commitIndex,
 		}
@@ -567,7 +567,6 @@ func (rf *Raft) CallHeartBeat(i int) {
 	if reply.Success == false {
 		if reply.NeedSync {
 			rf.nextIndex[i]--
-			PrettyDebug(dLog, "S%d->S%d nextIndex--:%d", rf.me, i, rf.nextIndex[i])
 		}
 	} else {
 		rf.nextIndex[i] = len(rf.logs) + 1
@@ -804,6 +803,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = 1
+	}
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.applyCh = applyCh
