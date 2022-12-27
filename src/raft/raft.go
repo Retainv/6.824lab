@@ -84,16 +84,25 @@ type Raft struct {
 
 	stopCh chan struct{} //首尾呼应，用来优雅关闭
 
+	// 2A选举参数
 	role       int
 	inElection bool // 是否正在进行选举
 	interrupt  bool // 选举过程中是否收到leader心跳
+	votedTerm  int  // 投票的term
 
-	votedTerm int // 投票的term
+	// 2B日志参数
+	commitIndex int
+	lastApplied int
+
+	// 2B -leader
+	nextIndex  []int
+	matchIndex []int
 }
 
 type LogEntry struct {
-	Term  int
-	Index int
+	Term    int
+	Command interface{}
+	Index   int
 }
 
 type AppendEntryArgs struct {
@@ -106,8 +115,10 @@ type AppendEntryArgs struct {
 	LeaderTerm   int // 心跳连接同步term
 }
 type AppendEntryReply struct {
-	Term    int
-	Success bool
+	Term       int
+	NextIndex  int
+	MatchIndex int
+	Success    bool
 }
 
 // return currentTerm and whether this server
@@ -234,7 +245,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 如果没有投票或者已投给该candidate，并且日志跟我一样或新，则投票给他
 
 	//PrettyDebug(dVote, "candidate %d term: %d, server %d term: %d\n", args.CandidateId, args.Term, rf.me, rf.currentTerm)
-	PrettyDebug(dVote, "S%d 收到S%d 的RequestVote,term:%d, \n", args.CandidateId, rf.me, rf.currentTerm)
+	//PrettyDebug(dVote, "S%d 收到S%d 的RequestVote,term:%d, \n", args.CandidateId, rf.me, rf.currentTerm)
 	if args.LastLogTerm >= lastLog.Term && args.LastLogIndex >= lastLog.Index && args.Term >= rf.currentTerm {
 		// 新一轮term
 		if args.Term > rf.votedTerm {
@@ -242,26 +253,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		// 如果该term还未投票或者已给他投票，则返回
 		if rf.votedFor == NO_VOTE || args.CandidateId == rf.votedFor {
-			PrettyDebug(dVote, "S%d voted for S%d", rf.me, args.CandidateId)
+			//PrettyDebug(dVote, "S%d voted for S%d", rf.me, args.CandidateId)
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			rf.persist()
-			PrettyDebug(dVote, "S%d投了S%d一票\n", rf.me, args.CandidateId)
+			//PrettyDebug(dVote, "S%d投了S%d一票\n", rf.me, args.CandidateId)
 		} else {
 			reply.VoteGranted = false
-			PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
+			//PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
 		}
 
 	} else {
 		reply.VoteGranted = false
-		PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
+		//PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
 	}
 }
 
 func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	reply.Term = rf.currentTerm
 	if args.Term == HEARTBEAT {
 		if args.LeaderTerm >= rf.currentTerm {
 			if rf.inElection {
@@ -271,25 +282,56 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 			rf.currentTerm = args.LeaderTerm
 			// 心跳重置选举时间
 			PrettyDebug(dTerm, "S%d 收到 S%d 心跳，重置选举时间, term:%d", rf.me, args.LeaderId, rf.currentTerm)
+			// 心跳同步日志
 			rf.ResetElectionTimer()
 			rf.votedFor = NO_VOTE
-			reply.Success = true
+			rf.AppendLog(args, reply)
+			return
 		} else {
-			reply.Term = rf.currentTerm
 			reply.Success = false
+			return
 		}
-
 	}
 
+	rf.AppendLog(args, reply)
+}
+
+func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
+	//PrettyDebug(dLog, "S%d received arg: %v", rf.me, args)
+	prevIndex, preLogTerm := 0, 0
+	if len(rf.logs) > 0 {
+		prevEntry := rf.logs[len(rf.logs)-1]
+		prevIndex = len(rf.logs) - 1
+		preLogTerm = prevEntry.Term
+	}
+	// 如果日志缺少，返回
+	if args.PrevLogIndex > prevIndex {
+		reply.Success = false
+		return
+	}
+	// 如果索引相同但term不同，返回，等待leader发送之前的日志
+	if args.PrevLogIndex == prevIndex && args.PrevLogTerm != preLogTerm {
+		reply.Success = false
+		return
+	}
+	if len(args.Entries) != 0 {
+		// 添加日志
+		entries := append(rf.logs, args.Entries...)
+		rf.logs = entries
+		PrettyDebug(dLog, "S%d appended log: %v", rf.me, args.Entries)
+	}
+	PrettyDebug(dLog, "S%d log: %v", rf.me, rf.logs)
+
+	reply.Success = true
 }
 
 func (rf *Raft) StartElection() {
 	rf.mu.Lock()
 	if rf.role != FOLLOWER {
-		PrettyDebug(dVote, "S%d role为 %d 无法开启选举", rf.me, rf.role)
+		//PrettyDebug(dVote, "S%d role为 %d 无法开启选举", rf.me, rf.role)
 		return
 	}
-	PrettyDebug(dVote, "S%d 开始选举", rf.me)
+	//PrettyDebug(dVote, "S%d 开始选举", rf.me)
 	rf.inElection = true
 	rf.role = CANDIDATE
 	lastLog := LogEntry{}
@@ -314,7 +356,7 @@ func (rf *Raft) StartElection() {
 	winElection := false
 	group := sync.WaitGroup{}
 	rf.mu.Unlock()
-	PrettyDebug(dVote, "S%d started election, candidate term:%d\n", rf.me, rf.currentTerm)
+	//PrettyDebug(dVote, "S%d started election, candidate term:%d\n", rf.me, rf.currentTerm)
 	//PrettyDebug(dTimer,)("peers:%v", len(rf.peers))
 	group.Add(len(rf.peers) - 1)
 
@@ -336,8 +378,8 @@ func (rf *Raft) StartElection() {
 				default:
 					reply := &RequestVoteReply{}
 					rf.sendRequestVote(i, args, reply)
-					PrettyDebug(dTrace, "S%d sent RequestVote to S%d", rf.me, i)
-					PrettyDebug(dTrace, "S%d to S%d，reply：%v", rf.me, i, reply)
+					//PrettyDebug(dTrace, "S%d sent RequestVote to S%d", rf.me, i)
+					//PrettyDebug(dTrace, "S%d to S%d，reply：%v", rf.me, i, reply)
 					// 如果别人的term比我大，则退出
 					if reply.Term > rf.currentTerm {
 						rf.mu.Lock()
@@ -352,12 +394,12 @@ func (rf *Raft) StartElection() {
 					}
 					if reply.VoteGranted {
 						atomic.AddInt32(&votedForMe, 1)
-						PrettyDebug(dTrace, "S%d got S%d's vote,votes:%d", rf.me, i, atomic.LoadInt32(&votedForMe))
+						//PrettyDebug(dTrace, "S%d got S%d's vote,votes:%d", rf.me, i, atomic.LoadInt32(&votedForMe))
 						// 如果票数超过一半，则不再等待
 						if atomic.LoadInt32(&votedForMe) > (int32(len(rf.peers)))/2 {
 							winElection = true
 							done <- true
-							PrettyDebug(dTrace, "S%d win!", rf.me)
+							//PrettyDebug(dTrace, "S%d win!", rf.me)
 						}
 						timeout <- true
 						//return
@@ -387,11 +429,11 @@ func (rf *Raft) StartElection() {
 		}
 	}()
 	<-done
-	PrettyDebug(dVote, "S%v got vote:%v", rf.me, votedForMe)
+	//PrettyDebug(dVote, "S%v got vote:%v", rf.me, votedForMe)
 	// 如果竞选过程中收到原来leader的消息变回了follower
 	if rf.interrupt {
 		rf.mu.Lock()
-		PrettyDebug(dVote, "S%d 选举过程中收到leader消息或别人term比我大，退出选举", rf.me)
+		//PrettyDebug(dVote, "S%d 选举过程中收到leader消息或别人term比我大，退出选举", rf.me)
 		//rf.currentTerm--
 		rf.votedFor = NO_VOTE
 		rf.role = FOLLOWER
@@ -411,7 +453,7 @@ func (rf *Raft) StartElection() {
 		rf.heartbeatTimer.Reset(HEARTBEATTIMEOUT)
 	} else {
 		//rf.currentTerm--
-		PrettyDebug(dVote, "S%d 选举失败！", rf.me)
+		//PrettyDebug(dVote, "S%d 选举失败！", rf.me)
 		rf.role = FOLLOWER
 		rf.ResetElectionTimer()
 	}
@@ -435,20 +477,89 @@ func (rf *Raft) SendHeartBeat() {
 }
 
 func (rf *Raft) CallHeartBeat(i int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	prevIndex, preLogTerm := 0, 0
+	if len(rf.logs) > 0 {
+		prevEntry := rf.logs[len(rf.logs)-1]
+		prevIndex = len(rf.logs) - 1
+		preLogTerm = prevEntry.Term
+	}
+
+	// 如果和我日志一样，则不需要同步
 	args := &AppendEntryArgs{
 		Term:         HEARTBEAT,
 		LeaderId:     rf.me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  preLogTerm,
 		Entries:      nil,
 		LeaderTerm:   rf.currentTerm,
 	}
+	// 否则发送nextIndex到后面所有的日志
+	PrettyDebug(dLog, "S%d nextIndex:%v", rf.me, rf.nextIndex)
+	if rf.nextIndex[i] < len(rf.logs) {
+		prevEntry := rf.logs[rf.nextIndex[i]-1]
+		args = &AppendEntryArgs{
+			Term:         HEARTBEAT,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevEntry.Index,
+			PrevLogTerm:  prevEntry.Term,
+			Entries:      rf.logs[rf.nextIndex[i]-1:],
+			LeaderTerm:   rf.currentTerm,
+		}
+	}
+
 	reply := &AppendEntryReply{}
 	rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
+	if reply.Success == false {
+		rf.nextIndex[i]--
+	} else {
+		rf.nextIndex[i] = len(rf.logs)
+	}
 	// 如果别人的term比我大，则卸任leader
 	//if reply.Term > rf.currentTerm {
 	//	rf.role = FOLLOWER
 	//}
+}
+
+func (rf *Raft) SyncClientRequestLog() {
+	PrettyDebug(dInfo, "rf log:%v", rf.logs)
+	// 如果还没有日志
+	prevIndex, preLogTerm := 0, 0
+	if len(rf.logs) > 1 {
+		// -2因为leader已经将最新的日志加进去了
+		prevEntry := rf.logs[len(rf.logs)-2]
+		prevIndex = len(rf.logs) - 2
+		preLogTerm = prevEntry.Term
+	}
+	// client新到的一条指令
+	args := &AppendEntryArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  preLogTerm,
+		Entries:      rf.logs[len(rf.logs)-1:],
+		LeaderTerm:   rf.currentTerm,
+	}
+	successCount := int32(1)
+	commitChan := make(chan bool)
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			reply := &AppendEntryReply{}
+			rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
+
+			if reply.Success {
+				atomic.AddInt32(&successCount, 1)
+				if atomic.LoadInt32(&successCount) > (int32(len(rf.peers)))/2 {
+					commitChan <- true
+				}
+			}
+		}(i)
+	}
+	<-commitChan
 }
 
 //
@@ -502,11 +613,33 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	PrettyDebug(dLog, "S%d 收到client：%v", rf.me, command)
+	if rf.killed() {
+		return index, term, false
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.role != LEADER {
+		return index, term, false
+	}
+	// 初始化日志
+	entry := LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+		Index:   len(rf.logs),
+	}
+	entries := append(rf.logs, entry)
+	rf.logs = entries
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.logs)
+	}
+	rf.SyncClientRequestLog()
+	index = len(entries)
+	term = rf.currentTerm
+	return index, term, true
 	// Your code here (2B).
 
-	return index, term, isLeader
 }
 
 //
@@ -582,6 +715,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.inElection = false
 	rf.role = FOLLOWER
 	rf.votedFor = NO_VOTE
+
+	// logs-2b
+	rf.logs = make([]LogEntry, 0)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
 	PrettyDebug(dInfo, "[Make] 创建raft peer：heartbeatTimer:%v", HEARTBEATTIMEOUT)
 	// Your initialization code here (2A, 2B, 2C).
 
