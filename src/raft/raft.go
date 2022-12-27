@@ -97,6 +97,8 @@ type Raft struct {
 	// 2B -leader
 	nextIndex  []int
 	matchIndex []int
+
+	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -115,10 +117,9 @@ type AppendEntryArgs struct {
 	LeaderTerm   int // 心跳连接同步term
 }
 type AppendEntryReply struct {
-	Term       int
-	NextIndex  int
-	MatchIndex int
-	Success    bool
+	Term     int
+	Success  bool
+	NeedSync bool // 是否需要同步日志
 }
 
 // return currentTerm and whether this server
@@ -256,8 +257,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			//PrettyDebug(dVote, "S%d voted for S%d", rf.me, args.CandidateId)
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
+			rf.votedTerm = args.Term
 			rf.persist()
-			//PrettyDebug(dVote, "S%d投了S%d一票\n", rf.me, args.CandidateId)
+			PrettyDebug(dVote, "S%d投了S%d一票, votedTerm:%d\n", rf.me, args.CandidateId, rf.votedTerm)
 		} else {
 			reply.VoteGranted = false
 			//PrettyDebug(dVote, "S%d拒绝给S%d投票,v:%d\n", rf.me, args.CandidateId, rf.votedFor)
@@ -281,14 +283,32 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 			rf.role = FOLLOWER
 			rf.currentTerm = args.LeaderTerm
 			// 心跳重置选举时间
-			PrettyDebug(dTerm, "S%d 收到 S%d 心跳，重置选举时间, term:%d", rf.me, args.LeaderId, rf.currentTerm)
-			// 心跳同步日志
+			PrettyDebug(dTerm, "S%d 收到 S%d 心跳, commitIndex:%d", rf.me, args.LeaderId, rf.commitIndex)
+
 			rf.ResetElectionTimer()
 			rf.votedFor = NO_VOTE
+			// 心跳同步日志
+			if args.LeaderCommit > rf.commitIndex {
+				// leaderCommit和我的日志最长部分取最小值
+				if args.LeaderCommit > len(rf.logs) {
+					rf.commitIndex = len(rf.logs)
+				} else {
+					rf.commitIndex = args.LeaderCommit
+				}
+				PrettyDebug(dTerm, "S%d reset commitIndex:%d, leaderCommit:%d", rf.me, rf.commitIndex, args.LeaderCommit)
+			}
+			// 通过applyCh发送日志
+			lastApplied := rf.lastApplied
+			PrettyDebug(dTerm, "S%d lastApplied:%d", rf.me, rf.lastApplied)
+			if lastApplied < rf.commitIndex {
+				rf.ApplyCommand()
+			}
+
 			rf.AppendLog(args, reply)
 			return
 		} else {
 			reply.Success = false
+			reply.NeedSync = false
 			return
 		}
 	}
@@ -296,21 +316,41 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 	rf.AppendLog(args, reply)
 }
 
+func (rf *Raft) ApplyCommand() {
+	lastApplied := rf.lastApplied
+	for i := lastApplied; i < rf.commitIndex; i++ {
+
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: i + 1,
+		}
+		rf.applyCh <- msg
+		rf.lastApplied++
+
+		PrettyDebug(dInfo, "S%d send log %v to applyCh", rf.me, msg)
+		PrettyDebug(dInfo, "S%d lastApplied: %d, commitIndex: %d", rf.me, rf.lastApplied, rf.commitIndex)
+	}
+}
 func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
-	//PrettyDebug(dLog, "S%d received arg: %v", rf.me, args)
+	PrettyDebug(dLog, "S%d received arg: %v", rf.me, args)
 	prevIndex, preLogTerm := 0, 0
 	if len(rf.logs) > 0 {
 		prevEntry := rf.logs[len(rf.logs)-1]
-		prevIndex = len(rf.logs) - 1
+		prevIndex = len(rf.logs)
 		preLogTerm = prevEntry.Term
 	}
 	// 如果日志缺少，返回
+	PrettyDebug(dLog, "S%d argsIndex:%d, prevIndex:%d", rf.me, args.PrevLogIndex, prevIndex)
+
 	if args.PrevLogIndex > prevIndex {
+		reply.NeedSync = true
 		reply.Success = false
 		return
 	}
 	// 如果索引相同但term不同，返回，等待leader发送之前的日志
 	if args.PrevLogIndex == prevIndex && args.PrevLogTerm != preLogTerm {
+		reply.NeedSync = true
 		reply.Success = false
 		return
 	}
@@ -318,9 +358,9 @@ func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
 		// 添加日志
 		entries := append(rf.logs, args.Entries...)
 		rf.logs = entries
-		PrettyDebug(dLog, "S%d appended log: %v", rf.me, args.Entries)
+		PrettyDebug(dInfo, "S%d appended log: %v", rf.me, args.Entries)
 	}
-	PrettyDebug(dLog, "S%d log: %v", rf.me, rf.logs)
+	PrettyDebug(dInfo, "S%d log: %v", rf.me, rf.logs)
 
 	reply.Success = true
 }
@@ -353,6 +393,7 @@ func (rf *Raft) StartElection() {
 	// 自己先投一票
 	votedForMe := int32(1)
 	rf.votedFor = rf.me
+	rf.votedTerm = rf.currentTerm
 	winElection := false
 	group := sync.WaitGroup{}
 	rf.mu.Unlock()
@@ -453,7 +494,7 @@ func (rf *Raft) StartElection() {
 		rf.heartbeatTimer.Reset(HEARTBEATTIMEOUT)
 	} else {
 		//rf.currentTerm--
-		//PrettyDebug(dVote, "S%d 选举失败！", rf.me)
+		PrettyDebug(dVote, "S%d 选举失败！", rf.me)
 		rf.role = FOLLOWER
 		rf.ResetElectionTimer()
 	}
@@ -474,6 +515,7 @@ func (rf *Raft) SendHeartBeat() {
 		}
 		go rf.CallHeartBeat(i)
 	}
+	PrettyDebug(dLeader, "S%d sent heartbeat success", rf.me)
 }
 
 func (rf *Raft) CallHeartBeat(i int) {
@@ -482,7 +524,7 @@ func (rf *Raft) CallHeartBeat(i int) {
 	prevIndex, preLogTerm := 0, 0
 	if len(rf.logs) > 0 {
 		prevEntry := rf.logs[len(rf.logs)-1]
-		prevIndex = len(rf.logs) - 1
+		prevIndex = len(rf.logs)
 		preLogTerm = prevEntry.Term
 	}
 
@@ -494,27 +536,42 @@ func (rf *Raft) CallHeartBeat(i int) {
 		PrevLogTerm:  preLogTerm,
 		Entries:      nil,
 		LeaderTerm:   rf.currentTerm,
+		LeaderCommit: rf.commitIndex,
 	}
 	// 否则发送nextIndex到后面所有的日志
 	PrettyDebug(dLog, "S%d nextIndex:%v", rf.me, rf.nextIndex)
 	if rf.nextIndex[i] < len(rf.logs) {
-		prevEntry := rf.logs[rf.nextIndex[i]-1]
+		prevIndex, preLogTerm := 0, 0
+		if rf.nextIndex[i] > 1 {
+			prevEntry := rf.logs[rf.nextIndex[i]-2]
+			prevIndex = prevEntry.Index
+			preLogTerm = prevEntry.Term
+		}
+		PrettyDebug(dLog, "S%d->S%d nextIndex:%d,", rf.me, i, rf.nextIndex[i])
 		args = &AppendEntryArgs{
 			Term:         HEARTBEAT,
 			LeaderId:     rf.me,
-			PrevLogIndex: prevEntry.Index,
-			PrevLogTerm:  prevEntry.Term,
-			Entries:      rf.logs[rf.nextIndex[i]-1:],
+			PrevLogIndex: prevIndex,
+			PrevLogTerm:  preLogTerm,
+			Entries:      rf.logs[rf.nextIndex[i]:],
 			LeaderTerm:   rf.currentTerm,
+			LeaderCommit: rf.commitIndex,
 		}
 	}
 
 	reply := &AppendEntryReply{}
 	rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
+	PrettyDebug(dLog, "S%d->S%d reply:%v", rf.me, i, reply)
+	PrettyDebug(dLog, "S%d->S%d 补发：%v", rf.me, i, args.Entries)
+
 	if reply.Success == false {
-		rf.nextIndex[i]--
+		if reply.NeedSync {
+			rf.nextIndex[i]--
+			PrettyDebug(dLog, "S%d->S%d nextIndex--:%d", rf.me, i, rf.nextIndex[i])
+		}
 	} else {
-		rf.nextIndex[i] = len(rf.logs)
+		rf.nextIndex[i] = len(rf.logs) + 1
+		rf.matchIndex[i] = len(rf.logs)
 	}
 	// 如果别人的term比我大，则卸任leader
 	//if reply.Term > rf.currentTerm {
@@ -523,13 +580,15 @@ func (rf *Raft) CallHeartBeat(i int) {
 }
 
 func (rf *Raft) SyncClientRequestLog() {
-	PrettyDebug(dInfo, "rf log:%v", rf.logs)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	PrettyDebug(dInfo, "S%d log:%v", rf.me, rf.logs)
 	// 如果还没有日志
 	prevIndex, preLogTerm := 0, 0
 	if len(rf.logs) > 1 {
-		// -2因为leader已经将最新的日志加进去了
+		// -1因为leader已经将最新的日志加进去了
 		prevEntry := rf.logs[len(rf.logs)-2]
-		prevIndex = len(rf.logs) - 2
+		prevIndex = len(rf.logs) - 1
 		preLogTerm = prevEntry.Term
 	}
 	// client新到的一条指令
@@ -549,9 +608,12 @@ func (rf *Raft) SyncClientRequestLog() {
 		}
 		go func(i int) {
 			reply := &AppendEntryReply{}
-			rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
 
+			rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
+			PrettyDebug(dInfo, "S%d->S%d reply:%v", rf.me, i, reply)
 			if reply.Success {
+				rf.nextIndex[i] = len(rf.logs) + 1
+				rf.matchIndex[i] = len(rf.logs)
 				atomic.AddInt32(&successCount, 1)
 				if atomic.LoadInt32(&successCount) > (int32(len(rf.peers)))/2 {
 					commitChan <- true
@@ -560,6 +622,22 @@ func (rf *Raft) SyncClientRequestLog() {
 		}(i)
 	}
 	<-commitChan
+	rf.commitIndex = len(rf.logs)
+	args.LeaderCommit = rf.commitIndex
+	args.Entries = nil
+	// todo: 通知server commit
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			reply := &AppendEntryReply{}
+			rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
+		}(i)
+	}
+
+	// leader apply
+	rf.ApplyCommand()
 }
 
 //
@@ -617,26 +695,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.killed() {
 		return index, term, false
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if rf.role != LEADER {
 		return index, term, false
 	}
+	PrettyDebug(dLog, "S%d 收到指令加锁", rf.me)
+	rf.mu.Lock()
 	// 初始化日志
 	entry := LogEntry{
 		Command: command,
 		Term:    rf.currentTerm,
-		Index:   len(rf.logs),
+		Index:   len(rf.logs) + 1,
 	}
 	entries := append(rf.logs, entry)
 	rf.logs = entries
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.logs)
+		rf.nextIndex[i] = len(rf.logs) + 1
 	}
-	rf.SyncClientRequestLog()
+	PrettyDebug(dLog, "S%d nextIndex:%v", rf.me, rf.nextIndex)
+	rf.mu.Unlock()
+
+	go rf.SyncClientRequestLog()
 	index = len(entries)
 	term = rf.currentTerm
+	PrettyDebug(dLog, "S%d 同步完成退出 %d,%d,%v", rf.me, index, term, true)
 	return index, term, true
 	// Your code here (2B).
 
@@ -685,6 +767,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 		case <-rf.electionTimer.C:
 			// leader超时选举
+			PrettyDebug(dTrace, "S%d 超时发起选举", rf.me)
 			rf.StartElection()
 		}
 
@@ -723,6 +806,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
+	rf.applyCh = applyCh
 	PrettyDebug(dInfo, "[Make] 创建raft peer：heartbeatTimer:%v", HEARTBEATTIMEOUT)
 	// Your initialization code here (2A, 2B, 2C).
 
