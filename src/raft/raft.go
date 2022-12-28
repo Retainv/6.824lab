@@ -57,7 +57,7 @@ var (
 
 	HEARTBEAT = -1
 
-	HEARTBEATTIMEOUT = 120 * time.Millisecond
+	HEARTBEATTIMEOUT = 150 * time.Millisecond
 
 	NO_VOTE = -1
 )
@@ -316,6 +316,7 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 	rf.AppendLog(args, reply)
 }
 
+// ApplyCommand commit后执行日志
 func (rf *Raft) ApplyCommand() {
 	lastApplied := rf.lastApplied
 	for i := lastApplied; i < rf.commitIndex; i++ {
@@ -601,26 +602,61 @@ func (rf *Raft) SyncClientRequestLog() {
 	}
 	successCount := int32(1)
 	commitChan := make(chan bool)
+	channels := make([]chan bool, len(rf.peers))
+
 	for i := range rf.peers {
+
 		if i == rf.me {
 			continue
 		}
 		go func(i int) {
-			reply := &AppendEntryReply{}
+			timeout := make(chan bool)
+			channels[i] = timeout
+			for {
+				select {
+				case <-timeout:
+					PrettyDebug(dTrace, "S%d->S%d log rpc out", rf.me, i)
+					return
+				default:
+					reply := &AppendEntryReply{}
 
-			rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
-			PrettyDebug(dInfo, "S%d->S%d reply:%v", rf.me, i, reply)
-			if reply.Success {
-				rf.nextIndex[i] = len(rf.logs) + 1
-				rf.matchIndex[i] = len(rf.logs)
-				atomic.AddInt32(&successCount, 1)
-				if atomic.LoadInt32(&successCount) > (int32(len(rf.peers)))/2 {
-					commitChan <- true
+					rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
+					PrettyDebug(dInfo, "S%d->S%d reply:%v", rf.me, i, reply)
+					if reply.Success {
+						rf.nextIndex[i] = len(rf.logs) + 1
+						rf.matchIndex[i] = len(rf.logs)
+						atomic.AddInt32(&successCount, 1)
+						if atomic.LoadInt32(&successCount) > (int32(len(rf.peers)))/2 {
+							commitChan <- true
+							timeout <- true
+						}
+					}
+					time.Sleep(50 * time.Millisecond)
 				}
 			}
 		}(i)
 	}
-	<-commitChan
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		for i := range channels {
+			channels[i] <- true
+		}
+	}()
+	select {
+	case <-commitChan:
+		PrettyDebug(dLog, "S%d 日志%v 广播commit", rf.me, args.Entries)
+		rf.BroadcastCommit(args)
+		// leader apply
+		rf.ApplyCommand()
+	case <-time.After(1 * time.Second):
+		PrettyDebug(dLog, "S%d 日志%v 未commit超时退出", rf.me, args.Entries)
+		return
+	}
+
+}
+
+// BroadcastCommit leader 广播通知commit
+func (rf *Raft) BroadcastCommit(args *AppendEntryArgs) {
 	rf.commitIndex = len(rf.logs)
 	args.LeaderCommit = rf.commitIndex
 	args.Entries = nil
@@ -634,9 +670,6 @@ func (rf *Raft) SyncClientRequestLog() {
 			rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
 		}(i)
 	}
-
-	// leader apply
-	rf.ApplyCommand()
 }
 
 //
