@@ -7,3 +7,6 @@ python dstest.py TestReElections2A -n 10 -v 1
 2B
 VERBOSE=1 go test -run TestBasicAgree2B | python dslogs.py -c 3
 VERBOSE=1 go test -run TestRPCBytes2B | python dslogs.py -c 3
+VERBOSE=1 go test -run TestFailAgree2B | python dslogs.py -c 3
+VERBOSE=1 go test -run TestFailNoAgree2B | python dslogs.py -c 5
+python dstest.py TestFailAgree2B -n 20 -v 1
