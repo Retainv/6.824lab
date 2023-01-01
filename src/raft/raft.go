@@ -239,6 +239,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
+	// 如果他的term比我大，则直接投他
+	if args.Term > rf.currentTerm && rf.votedTerm < args.Term {
+		rf.votedTerm = args.Term
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		return
+	}
 
 	lastLog := LogEntry{}
 	if len(rf.logs) == 0 {
@@ -253,7 +260,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//PrettyDebug(dVote, "candidate %d term: %d, server %d term: %d\n", args.CandidateId, args.Term, rf.me, rf.currentTerm)
 	//PrettyDebug(dVote, "S%d 收到S%d 的RequestVote,term:%d, \n", args.CandidateId, rf.me, rf.currentTerm)
-	if args.LastLogTerm >= lastLog.Term && args.LastLogIndex >= lastLog.Index && args.Term >= rf.currentTerm {
+	if args.LastLogTerm >= lastLog.Term && args.LastLogIndex >= lastLog.Index && args.Term == rf.currentTerm {
 		// 新一轮term
 		if args.Term > rf.votedTerm {
 			rf.votedFor = NO_VOTE
@@ -287,6 +294,7 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 	}
 	if args.Type == HEARTBEAT {
 		if args.Term >= rf.currentTerm {
+
 			if rf.inElection {
 				rf.interrupt = true
 			}
@@ -294,11 +302,20 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 			rf.mu.Lock()
 			rf.currentTerm = args.Term
 			rf.mu.Unlock()
+			rf.votedFor = NO_VOTE
+			// 防止旧Leader覆盖日志
+			if args.LeaderCommit < rf.commitIndex {
+				PrettyDebug(dTerm, "S%d 收到 S%d 心跳但commitIndex旧，不予回复, term:%d, leaderCommitIndex:%d, myCmtIndex:%d", rf.me, args.LeaderId, rf.currentTerm, args.LeaderCommit, rf.commitIndex)
+				rf.currentTerm = args.Term
+				reply.Success = false
+				reply.Term = rf.currentTerm
+				return
+			}
 			// 心跳重置选举时间
+			rf.ResetElectionTimer()
+
 			PrettyDebug(dTerm, "S%d 收到 S%d 心跳, leaderTerm:%d myterm:%d, leaderCommitIndex:%d, myCmtIndex:%d", rf.me, args.LeaderId, args.Term, rf.currentTerm, args.LeaderCommit, rf.commitIndex)
 
-			rf.ResetElectionTimer()
-			rf.votedFor = NO_VOTE
 			// 心跳同步日志
 			//rf.SyncCommitIndexAndApply(args, reply)
 			//} else {
@@ -326,14 +343,6 @@ func (rf *Raft) SyncCommitIndexAndApply(args *AppendEntryArgs, reply *AppendEntr
 		rf.AppendLog(args, reply)
 	}
 	rf.mu.Lock()
-	//if args.NextIndex != nil {
-	//	rf.nextIndex = args.NextIndex
-	//	PrettyDebug(dInfo, "S%d sync nextIndex:%v", rf.me, rf.nextIndex)
-	//}
-	//if args.MatchIndex != nil {
-	//	rf.matchIndex = args.MatchIndex
-	//	PrettyDebug(dInfo, "S%d sync matchIndex:%v", rf.me, rf.matchIndex)
-	//}
 	logs := rf.logs
 	if args.LeaderCommit > rf.commitIndex {
 		// leaderCommit和我的日志最长部分取最小值
@@ -345,12 +354,19 @@ func (rf *Raft) SyncCommitIndexAndApply(args *AppendEntryArgs, reply *AppendEntr
 		PrettyDebug(dTerm, "S%d reset commitIndex:%d, leaderCommit:%d", rf.me, rf.commitIndex, args.LeaderCommit)
 	}
 	rf.mu.Unlock()
-	// 通过applyCh发送日志
-	lastApplied := rf.lastApplied
-	PrettyDebug(dTerm, "S%d lastApplied:%d", rf.me, rf.lastApplied)
-	if lastApplied < rf.commitIndex {
-		rf.ApplyCommand()
+	// 检查commitIndex之前的日志是否正确，如果不正确则不commit，等待下次心跳同步
+	if len(logs) >= args.LeaderCommit && args.LeaderCommit > 0 {
+		commitIndexPrevEntry := logs[args.LeaderCommit-1]
+		PrettyDebug(dLog, "S%d commit received arg: %v", rf.me, args)
+		if commitIndexPrevEntry.Term == args.PrevLogTerm && commitIndexPrevEntry.Index == args.PrevLogIndex {
+			lastApplied := rf.lastApplied
+			if lastApplied < rf.commitIndex {
+				PrettyDebug(dTerm, "S%d ready to commit from:%d to %d", rf.me, rf.lastApplied, rf.commitIndex)
+				rf.ApplyCommand()
+			}
+		}
 	}
+
 }
 
 // ApplyCommand commit后执行日志
@@ -421,16 +437,23 @@ func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if args.PrevLogIndex < prevIndex || args.PrevLogIndex == prevIndex && args.PrevLogTerm != preLogTerm {
 		rf.mu.Lock()
 		// 截断冲突的日志
-		PrettyDebug(dLog, "S%d在%d处与leader日志冲突,准备删除", rf.me, prevIndex)
+		PrettyDebug(dLog, "S%d在%d处与leader日志冲突,准备删除", rf.me, args.PrevLogIndex)
 		if args.PrevLogIndex == 0 {
 			// 如果只有一个日志则全部清空
 			rf.logs = rf.logs[:0]
 			PrettyDebug(dLog, "S%d 清空了日志 logs：%v", rf.me, rf.logs)
 		} else {
-			// todo: ?
-			entries := rf.logs[args.PrevLogIndex:]
-			rf.logs = rf.logs[:args.PrevLogIndex]
-			PrettyDebug(dLog, "S%d delete logs：%v, log:%v", rf.me, entries, rf.logs)
+			// 如果前一个日志不一样，则删除前一个日志，否则不删除
+			leaderPrevPositionEntry := rf.logs[args.PrevLogIndex-1]
+			if leaderPrevPositionEntry.Index == args.PrevLogIndex && leaderPrevPositionEntry.Term == args.PrevLogTerm {
+				entries := rf.logs[args.PrevLogIndex:]
+				rf.logs = rf.logs[:args.PrevLogIndex]
+				PrettyDebug(dLog, "S%d 前一个日志不冲突delete logs：%v, log:%v", rf.me, entries, rf.logs)
+			} else {
+				entries := rf.logs[args.PrevLogIndex-1:]
+				rf.logs = rf.logs[:args.PrevLogIndex-1]
+				PrettyDebug(dLog, "S%d 前一个日志冲突，delete logs：%v, log:%v", rf.me, entries, rf.logs)
+			}
 		}
 		reply.NeedSync = true
 		reply.Success = false
@@ -573,7 +596,6 @@ func (rf *Raft) StartElection() {
 		return
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if winElection {
 		PrettyDebug(dVote, "S%d 成为leader,选举成功！term:%d", rf.me, rf.currentTerm)
 		rf.role = LEADER
@@ -583,6 +605,7 @@ func (rf *Raft) StartElection() {
 			rf.nextIndex[i] = newNextIndex
 			rf.matchIndex[i] = 0
 		}
+		rf.mu.Unlock()
 		rf.SendHeartBeat()
 		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(HEARTBEATTIMEOUT)
@@ -591,6 +614,7 @@ func (rf *Raft) StartElection() {
 		PrettyDebug(dVote, "S%d 选举失败！term:%d", rf.me, rf.currentTerm)
 		rf.role = FOLLOWER
 		rf.ResetElectionTimer()
+		rf.mu.Unlock()
 	}
 	rf.votedFor = NO_VOTE
 	rf.inElection = false
@@ -604,17 +628,6 @@ func (rf *Raft) SendHeartBeat() {
 	}
 	PrettyDebug(dLeader, "S%d is sending heartbeat, role: %d, term: %d", rf.me, rf.role, rf.currentTerm)
 	PrettyDebug(dLeader, "S%d nextIndex:%v", rf.me, rf.nextIndex)
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go rf.CallHeartBeat(i)
-	}
-	PrettyDebug(dLeader, "S%d sent heartbeat success", rf.me)
-}
-
-func (rf *Raft) CallHeartBeat(i int) {
-
 	// 保存临时变量，避免锁粒度太大
 	rf.mu.Lock()
 	logs := rf.logs
@@ -630,7 +643,6 @@ func (rf *Raft) CallHeartBeat(i int) {
 		prevIndex = len(logs)
 		preLogTerm = prevEntry.Term
 	}
-	PrettyDebug(dInfo, "S%d->S%d log:%v, prevIndex:%d, preTerm:%d", rf.me, i, logs, prevIndex, preLogTerm)
 
 	// 如果和我日志一样，则不需要同步
 	args := &AppendEntryArgs{
@@ -642,27 +654,40 @@ func (rf *Raft) CallHeartBeat(i int) {
 		Entries:      nil,
 		LeaderCommit: commitIndex,
 	}
-	// 否则发送nextIndex到后面所有的日志
-	if nextIndex[i]-1 < len(logs) {
-		prevIndex, preLogTerm := 0, 0
-		if nextIndex[i] > 1 {
-			// rf.nextIndex[i]-2 是为了匹配server的最新日志
-			prevEntry := logs[nextIndex[i]-2]
-			prevIndex = prevEntry.Index
-			preLogTerm = prevEntry.Term
-		}
-		args = &AppendEntryArgs{
-			Type:         HEARTBEAT,
-			Term:         currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevIndex,
-			PrevLogTerm:  preLogTerm,
-			// 从server最新日志后面一条开始到leader最新日志的所有日志补发
-			Entries:      logs[nextIndex[i]-1:],
-			LeaderCommit: commitIndex,
-		}
-	}
 
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// 否则发送nextIndex到后面所有的日志
+		if nextIndex[i]-1 < len(logs) {
+			prevIndex, preLogTerm := 0, 0
+			if nextIndex[i] > 1 {
+				// rf.nextIndex[i]-2 是为了匹配server的最新日志
+				prevEntry := logs[nextIndex[i]-2]
+				prevIndex = prevEntry.Index
+				preLogTerm = prevEntry.Term
+			}
+			args = &AppendEntryArgs{
+				Type:         HEARTBEAT,
+				Term:         currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevIndex,
+				PrevLogTerm:  preLogTerm,
+				// 从server最新日志后面一条开始到leader最新日志的所有日志补发
+				Entries:      logs[nextIndex[i]-1:],
+				LeaderCommit: commitIndex,
+			}
+		}
+		PrettyDebug(dInfo, "S%d->S%d log:%v, prevIndex:%d, preTerm:%d", rf.me, i, logs, prevIndex, preLogTerm)
+		go rf.CallHeartBeat(args, i)
+	}
+	PrettyDebug(dLeader, "S%d sent heartbeat success", rf.me)
+}
+
+func (rf *Raft) CallHeartBeat(args *AppendEntryArgs, i int) {
+
+	PrettyDebug(dLog, "S%d->S%d args:%v", rf.me, i, args)
 	reply := &AppendEntryReply{}
 	rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
 	PrettyDebug(dLog, "S%d->S%d reply:%v", rf.me, i, reply)
@@ -691,14 +716,15 @@ func (rf *Raft) CallHeartBeat(i int) {
 			rf.ApplyCommand()
 			rf.BroadcastCommit(index)
 		}
-
 	}
 	PrettyDebug(dLog, "S%d->S%d 发送心跳结束", rf.me, i)
 
 	// 如果别人的term比我大，则卸任leader
 	if reply.Term > rf.currentTerm {
+		rf.mu.Lock()
 		rf.currentTerm = reply.Term
 		rf.role = FOLLOWER
+		rf.mu.Unlock()
 	}
 }
 func (rf *Raft) CheckCommit(serverLogSyncIndex int) (bool, int) {
@@ -765,10 +791,27 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 					PrettyDebug(dTrace, "S%d->S%d log rpc out", rf.me, i)
 					return
 				default:
+					rf.mu.Lock()
+					if rf.role != LEADER {
+						rf.mu.Unlock()
+						PrettyDebug(dInfo, "S%d已转为follower，停止rpc1", rf.me)
+						timeout <- true
+						return
+					}
+					rf.mu.Unlock()
 					reply := &AppendEntryReply{}
 
 					rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
 					PrettyDebug(dInfo, "S%d->S%d reply:%v", rf.me, i, reply)
+					if reply.Term > rf.currentTerm {
+						rf.mu.Lock()
+						rf.role = FOLLOWER
+						rf.currentTerm = reply.Term
+						rf.mu.Unlock()
+						PrettyDebug(dInfo, "S%d已转为follower，停止rpc2", rf.me)
+						timeout <- true
+						return
+					}
 					if reply.Success {
 						rf.mu.Lock()
 						rf.nextIndex[i] = Max(len(logs)+1, rf.nextIndex[i])
@@ -781,7 +824,7 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 					}
 					if reply.Term == 0 && reply.Success == false && reply.NeedSync == false {
 						// 无响应继续发
-						PrettyDebug(dInfo, "S%d->S%d 重试:%v", rf.me, i, args)
+						PrettyDebug(dInfo, "S%d->S%d term:%d,重试:%v,", rf.me, i, rf.currentTerm, args)
 						time.Sleep(100 * time.Millisecond)
 					} else {
 						timeout <- true
@@ -801,7 +844,6 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 	case <-commitChan:
 		PrettyDebug(dLog, "S%d 日志%v 广播commit", rf.me, args.Entries)
 		rf.mu.Lock()
-		// todo: 不能简单++
 		rf.commitIndex = Max(rf.commitIndex, args.PrevLogIndex+len(args.Entries))
 		PrettyDebug(dInfo, "S%d commit to :%d", rf.me, rf.commitIndex)
 		rf.mu.Unlock()
@@ -825,7 +867,7 @@ func (rf *Raft) BroadcastCommit(commitIndex int) {
 	prevIndex, preLogTerm := 0, 0
 	PrettyDebug(dLog, "S%d 广播commit,commitIndex:%d", rf.me, commitIndex)
 	if commitIndex > 0 && len(logs) > 0 {
-		preLogTerm = logs[commitIndex-1].Term
+		prevIndex = logs[commitIndex-1].Index
 		preLogTerm = logs[commitIndex-1].Term
 
 	}
@@ -909,7 +951,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	PrettyDebug(dLog, "S%d 收到client：%v", rf.me, command)
+	PrettyDebug(dLog, "S%d role:%d,收到client：%v", rf.me, rf.role, command)
 	if rf.killed() {
 		return index, term, false
 	}
@@ -986,13 +1028,14 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTimer.C:
 			// leader定期发送心跳
 			rf.mu.Lock()
-			PrettyDebug(dTrace, "S%d role:%d", rf.me, rf.role)
-			if rf.role == LEADER {
+			role := rf.role
+			rf.mu.Unlock()
+			PrettyDebug(dTrace, "S%d role:%d", rf.me, role)
+			if role == LEADER {
 				rf.SendHeartBeat()
 				rf.heartbeatTimer.Reset(HEARTBEATTIMEOUT)
 				PrettyDebug(dLeader, "S%d reset heartbeat:%v", rf.me, HEARTBEATTIMEOUT)
 			}
-			rf.mu.Unlock()
 		case <-rf.electionTimer.C:
 			// leader超时选举
 			PrettyDebug(dTrace, "S%d 超时发起选举", rf.me)
