@@ -526,33 +526,43 @@ func TestBackup2B(t *testing.T) {
 
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
-	cfg.one(rand.Int(), servers, true)
+	cfg.one(rand.Int()%1, servers, true)
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
+	PrettyDebug(dTrace, "S%d diconnected!", (leader1+2)%servers)
+	PrettyDebug(dTrace, "S%d diconnected!", (leader1+3)%servers)
+	PrettyDebug(dTrace, "S%d diconnected!", (leader1+4)%servers)
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
-		cfg.rafts[leader1].Start(rand.Int())
+		cfg.rafts[leader1].Start(rand.Int() % 50)
 	}
+	PrettyDebug(dInfo, "0-50-no")
 
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
+	PrettyDebug(dTrace, "S%d diconnected!", (leader1+0)%servers)
+	PrettyDebug(dTrace, "S%d diconnected!", (leader1+1)%servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
+	PrettyDebug(dTrace, "S%d reconnected!", (leader1+2)%servers)
+	PrettyDebug(dTrace, "S%d reconnected!", (leader1+3)%servers)
+	PrettyDebug(dTrace, "S%d reconnected!", (leader1+4)%servers)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
-		cfg.one(rand.Int(), 3, true)
+		cfg.one(rand.Int()%50+50, 3, true)
 	}
+	PrettyDebug(dInfo, "50-100-yes")
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
@@ -561,32 +571,48 @@ func TestBackup2B(t *testing.T) {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
+	PrettyDebug(dTrace, "S%d diconnected!", other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
-		cfg.rafts[leader2].Start(rand.Int())
+		cfg.rafts[leader2].Start(rand.Int()%50 + 100)
 	}
+
+	PrettyDebug(dInfo, "100-150-no")
+	PrettyDebug(dInfo, "leader S%d log:%v", leader2, cfg.rafts[leader2].logs)
+	PrettyDebug(dInfo, "S0 log:%v", cfg.rafts[0].logs)
+	PrettyDebug(dInfo, "S1 log:%v", cfg.rafts[1].logs)
+	PrettyDebug(dInfo, "S2 log:%v", cfg.rafts[2].logs)
+	PrettyDebug(dInfo, "S3 log:%v", cfg.rafts[3].logs)
+	PrettyDebug(dInfo, "S4 log:%v", cfg.rafts[4].logs)
 
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		PrettyDebug(dTrace, "S%d diconnected!", i)
 	}
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
+	PrettyDebug(dTrace, "S%d reconnected!", (leader1+0)%servers)
+	PrettyDebug(dTrace, "S%d reconnected!", (leader1+1)%servers)
+	PrettyDebug(dTrace, "S%d reconnected!", other)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
-		cfg.one(rand.Int(), 3, true)
+		cfg.one(rand.Int()%50+150, 3, true)
 	}
+	PrettyDebug(dInfo, "150-200-yes")
 
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
+		PrettyDebug(dTrace, "S%d reconnected!", i)
 	}
-	cfg.one(rand.Int(), servers, true)
+	cfg.one(201, servers, true)
+	PrettyDebug(dInfo, "201-yes")
 
 	cfg.end()
 }

@@ -212,6 +212,7 @@ type RequestVoteArgs struct {
 	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
+	CommitIndex  int // leader的commitIndex
 	// Your data here (2A, 2B).
 }
 
@@ -234,8 +235,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	reply.Term = rf.currentTerm
-	// 如果我是leader并且他的term比我小，则拒绝
-	if rf.role == LEADER || args.Term < rf.currentTerm {
+	// 如果他的term比我小，则拒绝
+	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		return
 	}
@@ -246,6 +247,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		return
 	}
+	// 如果Candidate的commitIndex至少和我一样或比我大，则投票给他，否则不给他投票
+	//if args.CommitIndex >= rf.commitIndex {
+	//	reply.VoteGranted = true
+	//	rf.role = FOLLOWER
+	//	rf.votedFor = args.CandidateId
+	//	rf.votedTerm = args.Term
+	//	return
+	//}
+	//if rf.role == LEADER {
+	//
+	//	reply.VoteGranted = false
+	//	return
+	//}
 
 	lastLog := LogEntry{}
 	if len(rf.logs) == 0 {
@@ -286,12 +300,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// 如果还未初始化，则不接收
+	rf.mu.Lock()
 	if rf.currentTerm == 0 {
+		rf.mu.Unlock()
 		reply.Success = false
 		reply.Term = 0
 		reply.NeedSync = false
 		return
 	}
+	// 防止旧Leader覆盖日志
+	if args.LeaderCommit < rf.commitIndex {
+		PrettyDebug(dTerm, "S%d 收到 S%d 消息但commitIndex旧，不予回复, term:%d, leaderCommitIndex:%d, myCmtIndex:%d", rf.me, args.LeaderId, rf.currentTerm, args.LeaderCommit, rf.commitIndex)
+		if args.Term > rf.currentTerm {
+			rf.currentTerm = args.Term
+		}
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
 	if args.Type == HEARTBEAT {
 		if args.Term >= rf.currentTerm {
 
@@ -303,14 +331,7 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 			rf.currentTerm = args.Term
 			rf.mu.Unlock()
 			rf.votedFor = NO_VOTE
-			// 防止旧Leader覆盖日志
-			if args.LeaderCommit < rf.commitIndex {
-				PrettyDebug(dTerm, "S%d 收到 S%d 心跳但commitIndex旧，不予回复, term:%d, leaderCommitIndex:%d, myCmtIndex:%d", rf.me, args.LeaderId, rf.currentTerm, args.LeaderCommit, rf.commitIndex)
-				rf.currentTerm = args.Term
-				reply.Success = false
-				reply.Term = rf.currentTerm
-				return
-			}
+
 			// 心跳重置选举时间
 			rf.ResetElectionTimer()
 
@@ -342,31 +363,70 @@ func (rf *Raft) SyncCommitIndexAndApply(args *AppendEntryArgs, reply *AppendEntr
 	if args.Type != COMMIT {
 		rf.AppendLog(args, reply)
 	}
+	rf.ResetElectionTimer()
 	rf.mu.Lock()
 	logs := rf.logs
-	if args.LeaderCommit > rf.commitIndex {
-		// leaderCommit和我的日志最长部分取最小值
-		if args.LeaderCommit > len(logs) {
-			rf.commitIndex = len(logs)
-		} else {
-			rf.commitIndex = args.LeaderCommit
-		}
-		PrettyDebug(dTerm, "S%d reset commitIndex:%d, leaderCommit:%d", rf.me, rf.commitIndex, args.LeaderCommit)
+	// 如果已经提交到最新，则直接返回
+	if rf.lastApplied == rf.commitIndex && rf.commitIndex == args.LeaderCommit {
+		rf.mu.Unlock()
+		return
 	}
 	rf.mu.Unlock()
-	// 检查commitIndex之前的日志是否正确，如果不正确则不commit，等待下次心跳同步
-	if len(logs) >= args.LeaderCommit && args.LeaderCommit > 0 {
-		commitIndexPrevEntry := logs[args.LeaderCommit-1]
-		PrettyDebug(dLog, "S%d commit received arg: %v", rf.me, args)
-		if commitIndexPrevEntry.Term == args.PrevLogTerm && commitIndexPrevEntry.Index == args.PrevLogIndex {
-			lastApplied := rf.lastApplied
-			if lastApplied < rf.commitIndex {
-				PrettyDebug(dTerm, "S%d ready to commit from:%d to %d", rf.me, rf.lastApplied, rf.commitIndex)
-				rf.ApplyCommand()
+	needCommit := false
+	if args.LeaderCommit > 0 && len(logs) > 0 {
+
+		// 当leaderCommit<=我的日志长度时，检查commitIndex之前的日志是否正确，如果不正确则不commit，等待下次心跳同步
+		// 1、我断线后收到很多无效日志，需要删除掉 2、正常接收日志，等待一并提交
+		//if len(logs) >= args.LeaderCommit {
+		// 如果是commit消息则比较commitIndex处日志是否相同
+		if args.Type == COMMIT {
+
+			PrettyDebug(dLog, "S%d commit received arg: %v", rf.me, args)
+			// 1、还未收到日志先收到commit， 2、断线重连后大量无效日志并缺失日志都不更新等待同步
+			if args.LeaderCommit <= len(logs) {
+				commitIndexPrevEntry := logs[args.LeaderCommit-1]
+				leaderCommitEntry := args.Entries[0]
+				if commitIndexPrevEntry.Term == leaderCommitEntry.Term && commitIndexPrevEntry.Index == leaderCommitEntry.Index {
+					needCommit = true
+				}
+			}
+
+			// todo:如果commit消息不对应也需要进行处理：
+		} else {
+			if reply.Success {
+				// 如果是心跳或者append消息，已经在AppendEntry处理，判断reply,如果为false则不做操作
+				PrettyDebug(dLog, "S%d 日志已经同步，准备commit：%v", rf.me, args)
+				needCommit = true
 			}
 		}
+		if needCommit {
+			rf.mu.Lock()
+			if args.LeaderCommit > rf.commitIndex {
+				rf.commitIndex = Min(args.LeaderCommit, len(logs))
+				PrettyDebug(dTerm, "S%d reset commitIndex:%d, leaderCommit:%d", rf.me, rf.commitIndex, args.LeaderCommit)
+				lastApplied := rf.lastApplied
+				if lastApplied < rf.commitIndex {
+					rf.mu.Unlock()
+					PrettyDebug(dTerm, "S%d ready to commit from:%d to %d, lastApplied:%d", rf.me, rf.lastApplied+1, rf.commitIndex, rf.lastApplied)
+					rf.ApplyCommand()
+					return
+				}
+			}
+			rf.mu.Unlock()
+		}
 	}
+}
 
+// 检查leader和我日志的前一条是否对应
+func (rf *Raft) CheckPrevLogEntry(args *AppendEntryArgs) bool {
+	rf.mu.Lock()
+	logs := rf.logs
+	rf.mu.Unlock()
+	if args.PrevLogIndex == 0 && args.PrevLogTerm == 0 {
+		return len(logs) == 0 || len(logs) == 1
+	}
+	entry := logs[len(logs)-1]
+	return entry.Term == args.PrevLogTerm && entry.Index == args.PrevLogIndex
 }
 
 // ApplyCommand commit后执行日志
@@ -382,7 +442,7 @@ func (rf *Raft) ApplyCommand() {
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.logs[i].Command,
-			CommandIndex: i + 1,
+			CommandIndex: rf.logs[i].Index,
 		}
 		rf.applyCh <- msg
 		rf.lastApplied++
@@ -393,7 +453,16 @@ func (rf *Raft) ApplyCommand() {
 	rf.mu.Unlock()
 }
 
-// AppendLog 添加新日志，如果是心跳或者commit消息则不操作
+func (rf *Raft) CheckLogAtPrevIndex(args *AppendEntryArgs) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.PrevLogIndex <= len(rf.logs) {
+		return rf.logs[args.PrevLogIndex-1].Index == args.PrevLogIndex && rf.logs[args.PrevLogIndex-1].Term == args.PrevLogTerm
+	}
+	return false
+}
+
+// AppendLog 添加新日志，如果是commit消息则不操作
 func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	logs := rf.logs
@@ -401,17 +470,17 @@ func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	rf.mu.Unlock()
 	PrettyDebug(dLog, "S%d received arg: %v", rf.me, args)
-	PrettyDebug(dLog, "S%d logs: %v", rf.me, rf.logs)
+	PrettyDebug(dLog, "S%d logslen: %v", rf.me, len(rf.logs))
 	prevIndex, preLogTerm := 0, 0
 	if logLen > 0 {
 		prevEntry := logs[logLen-1]
-		prevIndex = logLen
+		prevIndex = prevEntry.Index
 		preLogTerm = prevEntry.Term
 	}
 	PrettyDebug(dLog, "S%d leaderPrevIndex:%d, prevIndex:%d", rf.me, args.PrevLogIndex, prevIndex)
 
 	// 缺少日志，需要同步
-	if args.PrevLogIndex > prevIndex {
+	if args.PrevLogIndex > prevIndex && logLen < args.PrevLogIndex {
 		reply.NeedSync = true
 		reply.Success = false
 		reply.LogIndex = logLen
@@ -420,45 +489,92 @@ func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	// 如果到达了以前的日志，比较最后一条日志索引和term是否相等，如果相等则忽略
 	// 比如到达[1 100 5]，则比较索引4处日志是否一样
-	if len(logs) > 0 && args.Entries != nil && args.PrevLogIndex < prevIndex {
-		argsLastEntry := args.Entries[len(args.Entries)-1]
-		myEntry := logs[argsLastEntry.Index-1]
-		if argsLastEntry.Index == myEntry.Index || argsLastEntry.Term == myEntry.Term {
-			reply.Success = true
-			reply.NeedSync = false
-			reply.Term = rf.currentTerm
-			reply.LogIndex = logLen
-			return
+	if len(logs) > 0 && len(args.Entries) >= 1 && args.PrevLogIndex < prevIndex {
+		// entris只有一条时有两种情况：1、旧指令 2、只补发一条日志
+		if len(args.Entries) == 1 {
+			argsLastEntry := args.Entries[0]
+			myEntry := logs[argsLastEntry.Index-1]
+			if argsLastEntry.Index == myEntry.Index && argsLastEntry.Term == myEntry.Term {
+				reply.Success = true
+				reply.NeedSync = false
+				reply.Term = rf.currentTerm
+				reply.LogIndex = logLen
+				return
+			} else {
+				// 根据args检查日志，冲突则删除
+				if !rf.CheckLogAtPrevIndex(args) {
+					rf.mu.Lock()
+					rf.logs = rf.logs[:len(rf.logs)-1]
+					rf.mu.Unlock()
+					reply.Success = false
+					reply.NeedSync = true
+					reply.Term = rf.currentTerm
+					reply.LogIndex = logLen
+					return
+				}
+			}
+		} else {
+			// 多条日志的情况：心跳补发多条日志
+			// 传多个日志时，比较首尾，如果不够，则根据开头添加
+			argsLastEntry := args.Entries[len(args.Entries)-1]
+
+			// 有两种情况：1、新日志还未进行添加  2、错误日志太多
+			if argsLastEntry.Index >= len(logs) {
+				// 比较len(logs)处的日志
+				lastEntry := LogEntry{}
+				argsEntry := LogEntry{}
+				if argsLastEntry.Index >= len(logs) {
+					lastEntry = logs[len(logs)-1]
+					argsEntry = args.Entries[len(logs)-args.PrevLogIndex-1]
+				} else {
+					lastEntry = logs[argsLastEntry.Index-1]
+					argsEntry = argsLastEntry
+				}
+
+				// 比较和leader最高共同索引处日志是否正确
+				if argsEntry.Index == lastEntry.Index && argsEntry.Term == lastEntry.Term {
+					// 心跳重复到达，忽略
+					if argsLastEntry.Index == lastEntry.Index && argsLastEntry.Term == lastEntry.Term {
+						reply.Success = true
+						reply.NeedSync = false
+						reply.LogIndex = len(logs)
+						return
+					}
+					// 添加后面的日志
+					rf.mu.Lock()
+					rf.logs = append(rf.logs, args.Entries[len(logs)-args.PrevLogIndex:]...)
+					reply.LogIndex = len(rf.logs)
+					PrettyDebug(dInfo, "S%d appended log: %v", rf.me, args.Entries[len(logs)-args.PrevLogIndex:])
+					PrettyDebug(dInfo, "S%d log: %v", rf.me, rf.logs)
+					rf.mu.Unlock()
+				} else {
+					// 删除args.prevIndex后的日志，并将args.Entries全部添加进去
+					rf.mu.Lock()
+					entries := rf.logs[args.PrevLogIndex:]
+					rf.logs = rf.logs[:args.PrevLogIndex]
+					rf.logs = append(rf.logs, args.Entries...)
+					reply.LogIndex = len(rf.logs)
+					PrettyDebug(dInfo, "S%d delete log: %v", rf.me, entries)
+					PrettyDebug(dInfo, "S%d appended log: %v", rf.me, args.Entries)
+					PrettyDebug(dInfo, "S%d log: %v", rf.me, rf.logs)
+					reply.Success = false
+					reply.NeedSync = true
+					reply.Term = rf.currentTerm
+					reply.LogIndex = len(rf.logs)
+					rf.mu.Unlock()
+				}
+			}
+
 		}
 
 	}
 	// 这里改为获取leader args位置的Log来比较，如果相等则不需要进行操作，避免被误删
 	// 如果我的索引比leader大、或者索引相同但term不同，根据发来日志的索引截断我的日志
-	if args.PrevLogIndex < prevIndex || args.PrevLogIndex == prevIndex && args.PrevLogTerm != preLogTerm {
-		rf.mu.Lock()
+	// 第一个条件是防止server出现多次添加同一日志，索引比leader小但是日志长度相同无法进行删除的情况
+
+	if args.PrevLogIndex > prevIndex && logLen >= args.PrevLogIndex || args.PrevLogIndex < prevIndex || args.PrevLogIndex == prevIndex && args.PrevLogTerm != preLogTerm {
 		// 截断冲突的日志
-		PrettyDebug(dLog, "S%d在%d处与leader日志冲突,准备删除", rf.me, args.PrevLogIndex)
-		if args.PrevLogIndex == 0 {
-			// 如果只有一个日志则全部清空
-			rf.logs = rf.logs[:0]
-			PrettyDebug(dLog, "S%d 清空了日志 logs：%v", rf.me, rf.logs)
-		} else {
-			// 如果前一个日志不一样，则删除前一个日志，否则不删除
-			leaderPrevPositionEntry := rf.logs[args.PrevLogIndex-1]
-			if leaderPrevPositionEntry.Index == args.PrevLogIndex && leaderPrevPositionEntry.Term == args.PrevLogTerm {
-				entries := rf.logs[args.PrevLogIndex:]
-				rf.logs = rf.logs[:args.PrevLogIndex]
-				PrettyDebug(dLog, "S%d 前一个日志不冲突delete logs：%v, log:%v", rf.me, entries, rf.logs)
-			} else {
-				entries := rf.logs[args.PrevLogIndex-1:]
-				rf.logs = rf.logs[:args.PrevLogIndex-1]
-				PrettyDebug(dLog, "S%d 前一个日志冲突，delete logs：%v, log:%v", rf.me, entries, rf.logs)
-			}
-		}
-		reply.NeedSync = true
-		reply.Success = false
-		reply.LogIndex = len(rf.logs)
-		rf.mu.Unlock()
+		rf.DeleteConflictLogs(args, reply)
 		return
 	}
 	if len(args.Entries) != 0 {
@@ -475,7 +591,31 @@ func (rf *Raft) AppendLog(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	reply.Success = true
 }
-
+func (rf *Raft) DeleteConflictLogs(args *AppendEntryArgs, reply *AppendEntryReply) {
+	rf.mu.Lock()
+	PrettyDebug(dLog, "S%d在%d处与leader日志冲突,准备删除", rf.me, args.PrevLogIndex)
+	if args.PrevLogIndex == 0 {
+		// 如果只有一个日志则全部清空
+		rf.logs = rf.logs[:0]
+		PrettyDebug(dLog, "S%d 清空了日志 logs：%v", rf.me, rf.logs)
+	} else {
+		// 如果前一个日志不一样，则删除前一个日志，否则不删除
+		leaderPrevPositionEntry := rf.logs[args.PrevLogIndex-1]
+		if leaderPrevPositionEntry.Index == args.PrevLogIndex && leaderPrevPositionEntry.Term == args.PrevLogTerm {
+			entries := rf.logs[args.PrevLogIndex:]
+			rf.logs = rf.logs[:args.PrevLogIndex]
+			PrettyDebug(dLog, "S%d 前一个日志不冲突delete logslen：%v, log:%v", rf.me, entries, len(rf.logs))
+		} else {
+			entries := rf.logs[args.PrevLogIndex-1:]
+			rf.logs = rf.logs[:args.PrevLogIndex-1]
+			PrettyDebug(dLog, "S%d 前一个日志冲突，delete logs：%v, log:%v", rf.me, entries, rf.logs)
+		}
+	}
+	reply.NeedSync = true
+	reply.Success = false
+	reply.LogIndex = len(rf.logs)
+	rf.mu.Unlock()
+}
 func (rf *Raft) StartElection() {
 	rf.mu.Lock()
 	if rf.role != FOLLOWER {
@@ -679,7 +819,7 @@ func (rf *Raft) SendHeartBeat() {
 				LeaderCommit: commitIndex,
 			}
 		}
-		PrettyDebug(dInfo, "S%d->S%d log:%v, prevIndex:%d, preTerm:%d", rf.me, i, logs, prevIndex, preLogTerm)
+		PrettyDebug(dInfo, "S%d->S%d log:%v, prevIndex:%d, preTerm:%d", rf.me, i, rf.logs, prevIndex, preLogTerm)
 		go rf.CallHeartBeat(args, i)
 	}
 	PrettyDebug(dLeader, "S%d sent heartbeat success", rf.me)
@@ -687,7 +827,7 @@ func (rf *Raft) SendHeartBeat() {
 
 func (rf *Raft) CallHeartBeat(args *AppendEntryArgs, i int) {
 
-	PrettyDebug(dLog, "S%d->S%d args:%v", rf.me, i, args)
+	//PrettyDebug(dLog, "S%d->S%d args:%v", rf.me, i, args)
 	reply := &AppendEntryReply{}
 	rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
 	PrettyDebug(dLog, "S%d->S%d reply:%v", rf.me, i, reply)
@@ -750,12 +890,14 @@ func (rf *Raft) CheckCommit(serverLogSyncIndex int) (bool, int) {
 }
 
 // SyncClientRequestLog 接收logs快照，防止多条请求跳过中间的日志
+// 并发收到过多时回影响心跳导致长时间发不出去心跳
 func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
+	commitIndex := rf.commitIndex
 	rf.mu.Unlock()
 
-	PrettyDebug(dInfo, "S%d log:%v", rf.me, logs)
+	PrettyDebug(dInfo, "S%d log:%v", rf.me, rf.logs)
 	// 如果还没有日志
 	prevIndex, preLogTerm := 0, 0
 	if len(logs) > 1 {
@@ -772,6 +914,7 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  preLogTerm,
 		Entries:      logs[len(logs)-1:],
+		LeaderCommit: commitIndex,
 	}
 	successCount := int32(1)
 	commitChan := make(chan bool)
@@ -791,14 +934,6 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 					PrettyDebug(dTrace, "S%d->S%d log rpc out", rf.me, i)
 					return
 				default:
-					rf.mu.Lock()
-					if rf.role != LEADER {
-						rf.mu.Unlock()
-						PrettyDebug(dInfo, "S%d已转为follower，停止rpc1", rf.me)
-						timeout <- true
-						return
-					}
-					rf.mu.Unlock()
 					reply := &AppendEntryReply{}
 
 					rf.peers[i].Call("Raft.ReceiveAppendEntries", args, reply)
@@ -825,7 +960,7 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 					if reply.Term == 0 && reply.Success == false && reply.NeedSync == false {
 						// 无响应继续发
 						PrettyDebug(dInfo, "S%d->S%d term:%d,重试:%v,", rf.me, i, rf.currentTerm, args)
-						time.Sleep(100 * time.Millisecond)
+						time.Sleep(150 * time.Millisecond)
 					} else {
 						timeout <- true
 					}
@@ -845,7 +980,7 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 		PrettyDebug(dLog, "S%d 日志%v 广播commit", rf.me, args.Entries)
 		rf.mu.Lock()
 		rf.commitIndex = Max(rf.commitIndex, args.PrevLogIndex+len(args.Entries))
-		PrettyDebug(dInfo, "S%d commit to :%d", rf.me, rf.commitIndex)
+		PrettyDebug(dInfo, "S%d commit to:%d", rf.me, rf.commitIndex)
 		rf.mu.Unlock()
 		rf.BroadcastCommit(rf.commitIndex)
 		// leader apply
@@ -866,11 +1001,14 @@ func (rf *Raft) BroadcastCommit(commitIndex int) {
 	rf.mu.Unlock()
 	prevIndex, preLogTerm := 0, 0
 	PrettyDebug(dLog, "S%d 广播commit,commitIndex:%d", rf.me, commitIndex)
-	if commitIndex > 0 && len(logs) > 0 {
-		prevIndex = logs[commitIndex-1].Index
-		preLogTerm = logs[commitIndex-1].Term
+	if commitIndex > 1 && len(logs) > 1 {
+		prevIndex = logs[commitIndex-2].Index
+		preLogTerm = logs[commitIndex-2].Term
 
 	}
+	commitEntries := make([]LogEntry, 0, 1)
+	commitEntry := logs[commitIndex-1]
+	entries := append(commitEntries, commitEntry)
 	//prevIndex, preLogTerm := 0, 0
 	//if len(logs) > 0 {
 	//	// -1因为leader已经将最新的日志加进去了
@@ -885,7 +1023,7 @@ func (rf *Raft) BroadcastCommit(commitIndex int) {
 		LeaderId:     rf.me,
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  preLogTerm,
-		Entries:      nil,
+		Entries:      entries,
 		LeaderCommit: commitIndex,
 	}
 	// 通知server commit

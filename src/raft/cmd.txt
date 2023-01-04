@@ -11,4 +11,5 @@ VERBOSE=1 go test -run TestFailAgree2B | python dslogs.py -c 3
 VERBOSE=1 go test -run TestFailNoAgree2B | python dslogs.py -c 5
 VERBOSE=1 go test -run TestConcurrentStarts2B | python dslogs.py -c 3
 VERBOSE=1 go test -run TestRejoin2B | python dslogs.py -c 3
-python dstest.py TestRejoin2B -n 50 -v 1
+VERBOSE=1 go test -run TestBackup2B | python dslogs.py -c 5
+python dstest.py TestBackup2B -n 20 -v 1
