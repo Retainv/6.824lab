@@ -118,6 +118,7 @@ type AppendEntryArgs struct {
 	PrevLogTerm  int
 	Entries      []LogEntry
 	LeaderCommit int
+
 	//NextIndex    []int // 同步
 	//MatchIndex   []int // 同步
 }
@@ -361,6 +362,7 @@ func (rf *Raft) ReceiveAppendEntries(args *AppendEntryArgs, reply *AppendEntryRe
 
 func (rf *Raft) SyncCommitIndexAndApply(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if args.Type != COMMIT {
+		rf.CheckLogIndex()
 		rf.AppendLog(args, reply)
 	}
 	rf.ResetElectionTimer()
@@ -413,6 +415,25 @@ func (rf *Raft) SyncCommitIndexAndApply(args *AppendEntryArgs, reply *AppendEntr
 				}
 			}
 			rf.mu.Unlock()
+		}
+	}
+}
+
+// 检查日志索引和长度是否匹配，防止出现同一个索引被添加多次
+func (rf *Raft) CheckLogIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	logs := rf.logs
+	if len(logs) > 0 {
+		if len(logs) == logs[len(logs)-1].Index {
+			return
+		} else {
+			for i := len(logs) - 1; i >= 0; i-- {
+				if logs[i].Index != i+1 {
+					rf.logs = append(rf.logs[:i], rf.logs[i+1:]...)
+					PrettyDebug(dTrace, "S%d 在%d处日志索引错误，删除", rf.me, i)
+				}
+			}
 		}
 	}
 }
@@ -768,6 +789,7 @@ func (rf *Raft) SendHeartBeat() {
 	}
 	PrettyDebug(dLeader, "S%d is sending heartbeat, role: %d, term: %d", rf.me, rf.role, rf.currentTerm)
 	PrettyDebug(dLeader, "S%d nextIndex:%v", rf.me, rf.nextIndex)
+	PrettyDebug(dLeader, "S%d matchIndex:%v", rf.me, rf.matchIndex)
 	// 保存临时变量，避免锁粒度太大
 	rf.mu.Lock()
 	logs := rf.logs
@@ -849,12 +871,17 @@ func (rf *Raft) CallHeartBeat(args *AppendEntryArgs, i int) {
 		success, index := rf.CheckCommit(rf.matchIndex[i])
 		if success {
 			rf.mu.Lock()
+			oldCommitIndex := rf.commitIndex
 			// 取最大值，避免旧日志覆盖
 			rf.commitIndex = Max(rf.commitIndex, index)
 			PrettyDebug(dLog, "S%d leader commit reset: %d", rf.me, rf.commitIndex)
 			rf.mu.Unlock()
-			rf.ApplyCommand()
-			rf.BroadcastCommit(index)
+			// 如果commitIndex不变，则不广播
+			if oldCommitIndex < rf.commitIndex {
+				rf.ApplyCommand()
+				rf.BroadcastCommit(index)
+			}
+
 		}
 	}
 	PrettyDebug(dLog, "S%d->S%d 发送心跳结束", rf.me, i)
@@ -960,7 +987,7 @@ func (rf *Raft) SyncClientRequestLog(logs []LogEntry) {
 					if reply.Term == 0 && reply.Success == false && reply.NeedSync == false {
 						// 无响应继续发
 						PrettyDebug(dInfo, "S%d->S%d term:%d,重试:%v,", rf.me, i, rf.currentTerm, args)
-						time.Sleep(150 * time.Millisecond)
+						time.Sleep(250 * time.Millisecond)
 					} else {
 						timeout <- true
 					}
